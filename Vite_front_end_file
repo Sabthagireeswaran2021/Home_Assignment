@@ -1,0 +1,82 @@
+npm create vite@latest
+
+from flask import Flask, request, jsonify
+from flask_sqlalchemy import SQLAlchemy
+from flask_bcrypt import Bcrypt
+from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+import boto3
+import os
+from werkzeug.utils import secure_filename
+
+app = Flask(__name__)
+
+# Configuration
+app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql://user:password@localhost/image_db'
+app.config['JWT_SECRET_KEY'] = 'your_secret_key'
+db = SQLAlchemy(app)
+bcrypt = Bcrypt(app)
+jwt = JWTManager(app)
+
+# AWS S3 Configuration
+S3_BUCKET = "your-s3-bucket-name"
+S3_REGION = "your-region"
+s3 = boto3.client("s3")
+
+# Database Models
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(50), unique=True, nullable=False)
+    password = db.Column(db.String(100), nullable=False)
+
+class Image(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    file_name = db.Column(db.String(200), nullable=False)
+    upload_time = db.Column(db.DateTime, server_default=db.func.now())
+
+# Routes
+@app.route('/register', methods=['POST'])
+def register():
+    data = request.json
+    hashed_pw = bcrypt.generate_password_hash(data['password']).decode('utf-8')
+    new_user = User(username=data['username'], password=hashed_pw)
+    db.session.add(new_user)
+    db.session.commit()
+    return jsonify({"message": "User registered successfully"}), 201
+
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.json
+    user = User.query.filter_by(username=data['username']).first()
+    if user and bcrypt.check_password_hash(user.password, data['password']):
+        token = create_access_token(identity=user.id)
+        return jsonify({"token": token})
+    return jsonify({"error": "Invalid credentials"}), 401
+
+@app.route('/upload', methods=['POST'])
+@jwt_required()
+def upload_image():
+    user_id = get_jwt_identity()
+    if 'file' not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+    
+    file = request.files['file']
+    file_name = secure_filename(file.filename)
+    s3.upload_fileobj(file, S3_BUCKET, file_name)
+    new_image = Image(user_id=user_id, file_name=file_name)
+    db.session.add(new_image)
+    db.session.commit()
+    
+    return jsonify({"message": "File uploaded successfully", "file_name": file_name})
+
+@app.route('/images', methods=['GET'])
+@jwt_required()
+def get_images():
+    user_id = get_jwt_identity()
+    images = Image.query.filter_by(user_id=user_id).all()
+    image_urls = [f"https://{S3_BUCKET}.s3.{S3_REGION}.amazonaws.com/{img.file_name}" for img in images]
+    return jsonify({"images": image_urls})
+
+if __name__ == '__main__':
+    db.create_all()
+    app.run(debug=True)
